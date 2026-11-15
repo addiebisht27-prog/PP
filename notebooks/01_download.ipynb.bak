@@ -1,0 +1,287 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# 01 - Download Sentinel-2 images of Ronti Peak (Chamoli), 2015-2021\n",
+    "\n",
+    "Week 2, part A of the Slope Watch project.\n",
+    "\n",
+    "What this notebook does:\n",
+    "\n",
+    "1. Searches a free public catalog for Sentinel-2 scenes covering the slope.\n",
+    "2. Lists the scenes and suggests one clear autumn date per year.\n",
+    "3. Reads only a 5 km crop around the collapse scar from each chosen scene.\n",
+    "4. Saves the crops to `data/chamoli/` with an index file.\n",
+    "5. Displays them so you can check they look right.\n",
+    "\n",
+    "Run the cells in order. Select the project's `.venv` as the notebook kernel first."
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 1. Setup"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "from pathlib import Path\n",
+    "\n",
+    "import matplotlib.pyplot as plt\n",
+    "import numpy as np\n",
+    "import pandas as pd\n",
+    "import rasterio\n",
+    "from pystac_client import Client\n",
+    "from rasterio.warp import transform_bounds\n",
+    "from rasterio.windows import from_bounds\n",
+    "\n",
+    "# Project root: works whether the notebook runs from notebooks/ or the repo root.\n",
+    "ROOT = Path.cwd() if (Path.cwd() / \".git\").exists() else Path.cwd().parent\n",
+    "DATA_DIR = ROOT / \"data\" / \"chamoli\"\n",
+    "DATA_DIR.mkdir(parents=True, exist_ok=True)\n",
+    "\n",
+    "# 5 km x 5 km box centred on the collapse scar (about 30.377 N, 79.731 E),\n",
+    "# located on Sentinel-2 images from 31 Jan and 10 Feb 2021 in the Copernicus Browser.\n",
+    "# Order: west, south, east, north (degrees).\n",
+    "BBOX = [79.705, 30.355, 79.757, 30.400]\n",
+    "\n",
+    "CATALOG_URL = \"https://earth-search.aws.element84.com/v1\"\n",
+    "COLLECTION = \"sentinel-2-l2a\"   # if 2015-2018 come back sparse, try \"sentinel-2-l1c\"\n",
+    "BAND = \"red\"                    # a 10 m band; \"nir\" also works\n",
+    "DATE_RANGE = \"2015-06-01/2021-02-06\"   # ends the day before the collapse\n",
+    "MAX_CLOUD = 20                  # percent, for the whole scene\n",
+    "print(\"Saving to:\", DATA_DIR)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 2. Search the catalog"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "catalog = Client.open(CATALOG_URL)\n",
+    "search = catalog.search(\n",
+    "    collections=[COLLECTION],\n",
+    "    bbox=BBOX,\n",
+    "    datetime=DATE_RANGE,\n",
+    "    query={\"eo:cloud_cover\": {\"lt\": MAX_CLOUD}},\n",
+    ")\n",
+    "items = list(search.items())\n",
+    "print(len(items), \"scenes found\")\n",
+    "\n",
+    "# Check the band names once; BAND above must be one of these.\n",
+    "if items:\n",
+    "    print(\"Available assets:\", sorted(items[0].assets.keys()))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 3. List the scenes and suggest dates\n",
+    "\n",
+    "The table shows every scene. The suggestion keeps October and November only\n",
+    "(little snow, similar sun angle each year) and picks the least cloudy scene per year.\n",
+    "\n",
+    "The cloud figure is for the whole 100 km scene, so it can be wrong for the slope itself.\n",
+    "Check each suggested date in the Copernicus Browser before trusting it."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "scenes = pd.DataFrame(\n",
+    "    {\n",
+    "        \"date\": [it.datetime.date() for it in items],\n",
+    "        \"cloud\": [it.properties.get(\"eo:cloud_cover\") for it in items],\n",
+    "        \"id\": [it.id for it in items],\n",
+    "    }\n",
+    ").sort_values(\"date\").reset_index(drop=True)\n",
+    "scenes[\"year\"] = pd.to_datetime(scenes[\"date\"]).dt.year\n",
+    "scenes[\"month\"] = pd.to_datetime(scenes[\"date\"]).dt.month\n",
+    "\n",
+    "print(scenes.groupby(\"year\").size().rename(\"scenes per year\"))\n",
+    "scenes"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "autumn = scenes[scenes[\"month\"].isin([10, 11])]\n",
+    "suggested = autumn.sort_values(\"cloud\").groupby(\"year\").head(2).sort_values(\"date\")\n",
+    "suggested[[\"date\", \"cloud\", \"id\"]]"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 4. Choose the dates\n",
+    "\n",
+    "Edit `CHOSEN_IDS` to the scenes you want (10 to 15 is a good number).\n",
+    "It starts as the suggestion from the cell above."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "CHOSEN_IDS = list(suggested[\"id\"])   # replace with your own list of ids if you prefer\n",
+    "\n",
+    "chosen_items = [it for it in items if it.id in set(CHOSEN_IDS)]\n",
+    "chosen_items.sort(key=lambda it: it.datetime)\n",
+    "print(len(chosen_items), \"scenes chosen\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 5. Read only the crop from each scene"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "def read_crop(item, bbox=BBOX, band=BAND):\n",
+    "    \"\"\"Read just the bbox window of one band from a scene, without downloading the whole file.\"\"\"\n",
+    "    with rasterio.open(item.assets[band].href) as src:\n",
+    "        box = transform_bounds(\"EPSG:4326\", src.crs, *bbox)\n",
+    "        window = from_bounds(*box, transform=src.transform)\n",
+    "        return src.read(1, window=window).astype(\"float32\")\n",
+    "\n",
+    "# Try one first.\n",
+    "test = read_crop(chosen_items[0])\n",
+    "print(\"Crop shape:\", test.shape, \"| value range:\", test.min(), \"to\", test.max())\n",
+    "plt.imshow(test, cmap=\"gray\")\n",
+    "plt.title(str(chosen_items[0].datetime.date()))\n",
+    "plt.axis(\"off\")\n",
+    "plt.show()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 6. Save all the crops and an index file\n",
+    "\n",
+    "Each crop is saved as `data/chamoli/YYYY-MM-DD.npy`.\n",
+    "If two scenes share a date, the less cloudy one is kept."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "rows, seen = [], set()\n",
+    "for item in sorted(chosen_items, key=lambda it: it.properties.get(\"eo:cloud_cover\", 100)):\n",
+    "    date = item.datetime.strftime(\"%Y-%m-%d\")\n",
+    "    if date in seen:\n",
+    "        continue\n",
+    "    seen.add(date)\n",
+    "    crop = read_crop(item)\n",
+    "    np.save(DATA_DIR / f\"{date}.npy\", crop)\n",
+    "    rows.append(\n",
+    "        {\n",
+    "            \"date\": date,\n",
+    "            \"cloud\": item.properties.get(\"eo:cloud_cover\"),\n",
+    "            \"id\": item.id,\n",
+    "            \"rows\": crop.shape[0],\n",
+    "            \"cols\": crop.shape[1],\n",
+    "            \"file\": f\"{date}.npy\",\n",
+    "        }\n",
+    "    )\n",
+    "    print(\"saved\", date, crop.shape)\n",
+    "\n",
+    "index = pd.DataFrame(rows).sort_values(\"date\").reset_index(drop=True)\n",
+    "index.to_csv(DATA_DIR / \"index.csv\", index=False)\n",
+    "index"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 7. Display and check\n",
+    "\n",
+    "Things to look for:\n",
+    "\n",
+    "- Every crop has the same shape (about 500 x 500) and shows the same area.\n",
+    "- The north face of Ronti Peak sits near the middle of each image.\n",
+    "- No crop is mostly cloud or fresh snow. Drop any that are, and rerun from step 4."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "metadata": {},
+   "execution_count": null,
+   "outputs": [],
+   "source": [
+    "index = pd.read_csv(DATA_DIR / \"index.csv\")\n",
+    "n = len(index)\n",
+    "cols = 4\n",
+    "fig, axes = plt.subplots(int(np.ceil(n / cols)), cols, figsize=(16, 4 * int(np.ceil(n / cols))))\n",
+    "for ax in np.atleast_1d(axes).ravel():\n",
+    "    ax.axis(\"off\")\n",
+    "for ax, (_, row) in zip(np.atleast_1d(axes).ravel(), index.iterrows()):\n",
+    "    img = np.load(DATA_DIR / row[\"file\"])\n",
+    "    lo, hi = np.percentile(img, [2, 98])\n",
+    "    ax.imshow(np.clip((img - lo) / (hi - lo + 1e-9), 0, 1), cmap=\"gray\")\n",
+    "    ax.set_title(f\"{row['date']}  (cloud {row['cloud']:.0f}%)\")\n",
+    "plt.tight_layout()\n",
+    "plt.show()\n",
+    "\n",
+    "print(\"Shapes:\", sorted(set(zip(index[\"rows\"], index[\"cols\"]))))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "---\n",
+    "Contains modified Copernicus Sentinel data, accessed through the Earth Search catalog on AWS Open Data.\n",
+    "\n",
+    "Next: `02_testbed.ipynb` (shift a patch by a known amount, add noise and fake clouds)."
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "name": "python"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
